@@ -170,6 +170,23 @@ struct GpuOutput {
 }
 
 async fn calculate_pi_gpu(n: u64) -> f64 {
+    // 对于超大数据集，增加GPU处理能力，限制提高到1万亿
+    if n > 1_000_000_000_000 {  // 1万亿
+        println!("数据量过大，GPU计算限制为1万亿个采样点，超出部分使用CPU计算");
+        let gpu_samples = 1_000_000_000_000u64;
+        let cpu_samples = n - gpu_samples;
+        
+        let gpu_pi = Box::pin(calculate_pi_gpu_impl(gpu_samples)).await;
+        let cpu_pi = calculate_pi_monte_carlo_mt(cpu_samples);
+        
+        // 加权平均
+        return (gpu_pi * gpu_samples as f64 + cpu_pi * cpu_samples as f64) / n as f64;
+    }
+    
+    calculate_pi_gpu_impl(n).await
+}
+
+async fn calculate_pi_gpu_impl(n: u64) -> f64 {
     // 初始化GPU设备
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::all(),
@@ -199,13 +216,42 @@ async fn calculate_pi_gpu(n: u64) -> f64 {
 
     println!("GPU设备: {}", adapter.get_info().name);
     
-    // 简化工作组计算 - 限制为最多10000个工作组
-    let max_workgroups = std::cmp::min(10000, n / 1000).max(1) as u32;
-    let samples_per_workgroup = (n / max_workgroups as u64) as u32;
-    let remaining_samples = (n % max_workgroups as u64) as u32;
+    // 获取GPU的真实限制
+    let limits = device.limits();
+    let max_compute_workgroups_per_dimension = limits.max_compute_workgroups_per_dimension;
+    let max_buffer_size = limits.max_buffer_size;
+    
+    println!("GPU限制: 最大工作组数 = {}, 最大缓冲区大小 = {} MB", 
+             max_compute_workgroups_per_dimension, 
+             max_buffer_size / 1024 / 1024);
+    
+    // 智能计算工作组数量 - 基于GPU实际限制
+    let ideal_workgroups = std::cmp::min(
+        max_compute_workgroups_per_dimension, 
+        (n / 10000).max(1) as u32  // 每个工作组至少处理10000个样本
+    );
+    
+    // 确保单个工作组的样本数不超过u32最大值
+    let samples_per_workgroup = std::cmp::min(
+        u32::MAX as u64, 
+        (n / ideal_workgroups as u64).max(1)
+    ) as u32;
+    
+    let actual_workgroups = std::cmp::min(
+        ideal_workgroups,
+        ((n as f64) / (samples_per_workgroup as f64)).ceil() as u32
+    );
+    
+    let remaining_samples = (n % (actual_workgroups as u64 * samples_per_workgroup as u64)) as u32;
+    
+    // 如果单个工作组需要处理的样本数为0，说明数据分配有问题
+    if samples_per_workgroup == 0 || actual_workgroups == 0 {
+        println!("数据量太大，GPU无法处理，回退到CPU计算");
+        return calculate_pi_monte_carlo_mt(n);
+    }
     
     println!("工作组数量: {}, 每组处理样本数: {}, 剩余样本: {}", 
-             max_workgroups, samples_per_workgroup, remaining_samples);
+             actual_workgroups, samples_per_workgroup, remaining_samples);
     
     // 创建计算着色器 - 使用内联字符串而不是文件
     let compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -228,7 +274,7 @@ var<storage, read_write> output: array<Output>;
 
 fn random(state: ptr<function, u32>) -> f32 {
     *state = (*state * 1103515245u + 12345u);
-    return f32(*state) / 4294967295.0;
+    return f32(*state) / 4294967296.0;
 }
 
 @compute @workgroup_size(256)
@@ -238,7 +284,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         return;
     }
     
-    var rng_state = input.seed + index * 1000u;
+    // 确保每个线程有不同的随机种子
+    var rng_state = input.seed + index * 2654435761u;
     var inside_count = 0u;
     
     for (var i = 0u; i < input.total_samples; i++) {
@@ -246,7 +293,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let y = random(&rng_state) * 2.0 - 1.0;
         
         if (x * x + y * y <= 1.0) {
-            inside_count++;
+            inside_count = inside_count + 1u;
         }
     }
     
@@ -260,7 +307,10 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         label: Some("Input Buffer"),
         contents: bytemuck::cast_slice(&[GpuInput {
             total_samples: samples_per_workgroup,
-            seed: 12345,
+            seed: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as u32,
         }]),
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
@@ -268,7 +318,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // 创建输出缓冲区
     let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("Output Buffer"),
-        size: (max_workgroups * std::mem::size_of::<GpuOutput>() as u32) as u64,
+        size: (actual_workgroups * std::mem::size_of::<GpuOutput>() as u32) as u64,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
@@ -350,7 +400,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         });
         compute_pass.set_pipeline(&compute_pipeline);
         compute_pass.set_bind_group(0, &bind_group, &[]);
-        compute_pass.dispatch_workgroups(max_workgroups, 1, 1);
+        compute_pass.dispatch_workgroups(actual_workgroups, 1, 1);
     }
 
     encoder.copy_buffer_to_buffer(&output_buffer, 0, &staging_buffer, 0, output_buffer.size());
@@ -367,7 +417,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let result: &[GpuOutput] = bytemuck::cast_slice(&data);
         
         let total_inside: u64 = result.iter().map(|r| r.inside_count as u64).sum();
-        let processed_samples = max_workgroups as u64 * samples_per_workgroup as u64;
+        let processed_samples = actual_workgroups as u64 * samples_per_workgroup as u64;
         
         println!("GPU计算完成: 圆内点数 = {}, 处理样本数 = {}", total_inside, processed_samples);
         
