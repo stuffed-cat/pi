@@ -42,15 +42,28 @@ fn main() {
         }
     };
     
+    // 收集用户随机输入作为熵源
+    println!("\n为了提高随机性，请随机敲击键盘几次（按回车结束）：");
+    println!("提示：请随机按任意字符键，然后按回车确认");
+    
+    let mut entropy_input = String::new();
+    io::stdin()
+        .read_line(&mut entropy_input)
+        .expect("读取熵输入失败");
+    
+    // 从用户输入生成熵
+    let user_entropy = generate_entropy_from_input(&entropy_input);
+    println!("已收集到 {} 字节的用户熵", entropy_input.len());
+    
     println!("开始计算...");
     let start_time = std::time::Instant::now();
     
     let pi = if use_gpu {
         println!("使用GPU计算");
-        pollster::block_on(calculate_pi_gpu(n))
+        pollster::block_on(calculate_pi_gpu(n, user_entropy))
     } else {
         println!("使用CPU多线程计算");
-        calculate_pi_monte_carlo_mt(n)
+        calculate_pi_monte_carlo_mt(n, user_entropy)
     };
     
     let duration = start_time.elapsed();
@@ -64,7 +77,36 @@ fn main() {
     println!("计算耗时: {:.2?}", duration);
 }
 
-fn calculate_pi_monte_carlo_mt(n: u128) -> f64 {
+// 从用户输入生成熵
+fn generate_entropy_from_input(input: &str) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    
+    let mut hasher = DefaultHasher::new();
+    
+    // 哈希用户输入
+    input.hash(&mut hasher);
+    
+    // 添加当前时间作为额外熵
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    now.hash(&mut hasher);
+    
+    // 添加输入长度和字符统计
+    input.len().hash(&mut hasher);
+    
+    // 对每个字符的位置和值进行哈希
+    for (i, ch) in input.chars().enumerate() {
+        (i, ch as u32).hash(&mut hasher);
+    }
+    
+    hasher.finish()
+}
+
+fn calculate_pi_monte_carlo_mt(n: u128, user_entropy: u64) -> f64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     
     // 获取系统CPU核心数
@@ -96,11 +138,17 @@ fn calculate_pi_monte_carlo_mt(n: u128) -> f64 {
         let handle = thread::spawn(move || {
             use std::time::{SystemTime, UNIX_EPOCH};
             
-            // 每个线程使用不同的随机种子
-            let seed = SystemTime::now()
+            // 每个线程使用不同的随机种子，结合用户熵
+            let base_seed = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
-                .as_nanos() as u64 + (i as u64) * 1000000;
+                .as_nanos() as u64;
+            
+            // 将用户熵与时间和线程ID结合
+            let seed = base_seed 
+                .wrapping_add(user_entropy) 
+                .wrapping_add((i as u64) * 1000000)
+                .wrapping_mul(i as u64 + 1);
             
             let mut rng = SimpleRng::new(seed);
             let mut local_inside = 0;
@@ -176,6 +224,8 @@ impl SimpleRng {
 struct GpuInput {
     samples_per_workgroup: u32,
     extra_samples: u32,
+    user_entropy_low: u32,
+    user_entropy_high: u32,
 }
 
 #[repr(C)]
@@ -184,11 +234,11 @@ struct GpuOutput {
     inside_count: u32,
 }
 
-async fn calculate_pi_gpu(n: u128) -> f64 {
-    calculate_pi_gpu_impl(n).await
+async fn calculate_pi_gpu(n: u128, user_entropy: u64) -> f64 {
+    calculate_pi_gpu_impl(n, user_entropy).await
 }
 
-async fn calculate_pi_gpu_impl(n: u128) -> f64 {
+async fn calculate_pi_gpu_impl(n: u128, user_entropy: u64) -> f64 {
     // 初始化GPU设备
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::all(),
@@ -236,7 +286,7 @@ async fn calculate_pi_gpu_impl(n: u128) -> f64 {
     if n <= max_samples_per_batch {
         // 单批次处理
         println!("使用单批次GPU处理");
-        calculate_pi_gpu_batch(&device, &queue, n, max_compute_workgroups_per_dimension).await
+        calculate_pi_gpu_batch(&device, &queue, n, max_compute_workgroups_per_dimension, user_entropy).await
     } else {
         // 多批次处理
         let num_batches = ((n as f64) / (max_samples_per_batch as f64)).ceil() as u128;
@@ -252,7 +302,7 @@ async fn calculate_pi_gpu_impl(n: u128) -> f64 {
             
             println!("处理批次 {}/{}: {} 个采样点", batch + 1, num_batches, batch_size);
             
-            let batch_pi = calculate_pi_gpu_batch(&device, &queue, batch_size, max_compute_workgroups_per_dimension).await;
+            let batch_pi = calculate_pi_gpu_batch(&device, &queue, batch_size, max_compute_workgroups_per_dimension, user_entropy.wrapping_add(batch as u64)).await;
             let batch_inside = (batch_pi * batch_size as f64 / 4.0) as u128;
             
             total_inside += batch_inside;
@@ -268,7 +318,7 @@ async fn calculate_pi_gpu_impl(n: u128) -> f64 {
     }
 }
 
-async fn calculate_pi_gpu_batch(device: &wgpu::Device, queue: &wgpu::Queue, n: u128, max_workgroups: u32) -> f64 {
+async fn calculate_pi_gpu_batch(device: &wgpu::Device, queue: &wgpu::Queue, n: u128, max_workgroups: u32, user_entropy: u64) -> f64 {
     let max_samples_per_workgroup = 200000u32;
     
     // 计算这个批次的工作组配置
@@ -288,6 +338,8 @@ async fn calculate_pi_gpu_batch(device: &wgpu::Device, queue: &wgpu::Queue, n: u
 struct Input {
     samples_per_workgroup: u32,
     extra_samples: u32,
+    user_entropy_low: u32,
+    user_entropy_high: u32,
 }
 
 struct Output {
@@ -349,9 +401,10 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         return;
     }
     
-    // 使用更复杂的种子生成策略，包含时间相关的变化
-    var base_seed = 12345u + workgroup_id * 1013904223u;
-    var time_seed = workgroup_id * 982451653u + 1234567u;
+    // 使用更复杂的种子生成策略，结合用户熵
+    var user_entropy = (input.user_entropy_high << 16u) | input.user_entropy_low;
+    var base_seed = 12345u + workgroup_id * 1013904223u + user_entropy;
+    var time_seed = workgroup_id * 982451653u + 1234567u + (user_entropy >> 16u);
     var rng_state = wang_hash(base_seed) ^ pcg_hash(time_seed);
     
     // 确保种子不为0
@@ -394,6 +447,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         contents: bytemuck::cast_slice(&[GpuInput {
             samples_per_workgroup: samples_per_workgroup,
             extra_samples: extra_samples,
+            user_entropy_low: (user_entropy & 0xFFFFFFFF) as u32,
+            user_entropy_high: (user_entropy >> 32) as u32,
         }]),
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
