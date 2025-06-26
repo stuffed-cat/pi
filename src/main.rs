@@ -59,9 +59,10 @@ fn main() {
     let duration = start_time.elapsed();
     
     println!("使用 {} 个采样点", n);
-    println!("计算得到的π值: {}", pi);
-    println!("真实π值: {}", std::f64::consts::PI);
-    println!("误差: {}", (pi - std::f64::consts::PI).abs());
+    println!("计算得到的π值: {:.20}", pi);
+    println!("真实π值:       {:.20}", std::f64::consts::PI);
+    println!("误差:          {:.20}", (pi - std::f64::consts::PI).abs());
+    println!("相对误差:      {:.2e}", (pi - std::f64::consts::PI).abs() / std::f64::consts::PI * 100.0);
     println!("计算耗时: {:.2?}", duration);
 }
 
