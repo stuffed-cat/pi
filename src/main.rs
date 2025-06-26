@@ -212,37 +212,61 @@ async fn calculate_pi_gpu_impl(n: u64) -> f64 {
              max_compute_workgroups_per_dimension, 
              max_buffer_size / 1024 / 1024);
     
-    // 智能计算工作组数量 - 进一步降低每组样本数
-    let max_samples_per_workgroup = 50000u32; // 每组最多5万样本，确保GPU稳定性
+    // GPU分批处理策略
+    let max_samples_per_workgroup = 200000u32; // 每组最多20万样本
+    let max_samples_per_batch = max_compute_workgroups_per_dimension as u64 * max_samples_per_workgroup as u64;
     
-    // 计算最优工作组配置
+    println!("GPU单批次最大处理能力: {} 个采样点", max_samples_per_batch);
+    
+    if n <= max_samples_per_batch {
+        // 单批次处理
+        println!("使用单批次GPU处理");
+        calculate_pi_gpu_batch(&device, &queue, n, max_compute_workgroups_per_dimension).await
+    } else {
+        // 多批次处理
+        let num_batches = ((n as f64) / (max_samples_per_batch as f64)).ceil() as u64;
+        println!("数据量过大，将分 {} 个批次进行GPU处理", num_batches);
+        
+        let mut total_inside = 0u64;
+        let mut processed_samples = 0u64;
+        
+        for batch in 0..num_batches {
+            let batch_start = batch * max_samples_per_batch;
+            let batch_end = std::cmp::min((batch + 1) * max_samples_per_batch, n);
+            let batch_size = batch_end - batch_start;
+            
+            println!("处理批次 {}/{}: {} 个采样点", batch + 1, num_batches, batch_size);
+            
+            let batch_pi = calculate_pi_gpu_batch(&device, &queue, batch_size, max_compute_workgroups_per_dimension).await;
+            let batch_inside = (batch_pi * batch_size as f64 / 4.0) as u64;
+            
+            total_inside += batch_inside;
+            processed_samples += batch_size;
+            
+            // 显示进度
+            let progress = ((batch + 1) as f64 / num_batches as f64) * 100.0;
+            println!("批次 {}/{} 完成，进度: {:.1}%", batch + 1, num_batches, progress);
+        }
+        
+        println!("GPU分批处理完成: 总圆内点数 = {}, 总样本数 = {}", total_inside, processed_samples);
+        4.0 * total_inside as f64 / processed_samples as f64
+    }
+}
+
+async fn calculate_pi_gpu_batch(device: &wgpu::Device, queue: &wgpu::Queue, n: u64, max_workgroups: u32) -> f64 {
+    let max_samples_per_workgroup = 200000u32;
+    
+    // 计算这个批次的工作组配置
     let ideal_workgroups = std::cmp::min(
-        max_compute_workgroups_per_dimension,
+        max_workgroups,
         ((n as f64) / (max_samples_per_workgroup as f64)).ceil() as u32
     );
     
-    // 如果需要的工作组数超过GPU限制，调整每组样本数
-    let actual_workgroups = if ideal_workgroups > max_compute_workgroups_per_dimension {
-        max_compute_workgroups_per_dimension
-    } else {
-        ideal_workgroups
-    };
-    
-    // 平均分配样本到工作组
+    let actual_workgroups = if ideal_workgroups == 0 { 1 } else { ideal_workgroups };
     let samples_per_workgroup = (n / actual_workgroups as u64) as u32;
     let extra_samples = (n % actual_workgroups as u64) as u32;
     
-    // 检查每组样本数是否仍然过多
-    if samples_per_workgroup > 1000000 {
-        println!("警告: 每个工作组仍需处理 {} 个样本，可能导致GPU超时", samples_per_workgroup);
-        println!("建议减少采样点数量或使用CPU计算");
-    }
-    
-    println!("GPU配置: 工作组数 = {}, 每组基础样本数 = {}, 额外样本 = {}", 
-             actual_workgroups, samples_per_workgroup, extra_samples);
-    println!("GPU将处理全部 {} 个采样点", n);
-    
-    // 创建计算着色器 - 修复随机数生成和样本数分配问题
+    // 创建计算着色器
     let compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("Monte Carlo Pi Compute Shader"),
         source: wgpu::ShaderSource::Wgsl(r#"
@@ -428,29 +452,12 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         
         let total_inside: u64 = result.iter().map(|r| r.inside_count as u64).sum();
         
-        println!("GPU计算完成: 圆内点数 = {}, 总样本数 = {} (100%GPU处理)", total_inside, n);
-        
-        // 检查结果是否合理
-        if total_inside == 0 && n > 0 {
-            println!("错误: GPU计算返回0个圆内点数，可能是计算错误");
-            println!("前几个工作组的结果: {:?}", &result[..std::cmp::min(5, result.len())]);
-            println!("回退到CPU计算");
-            drop(data);
-            staging_buffer.unmap();
-            return calculate_pi_monte_carlo_mt(n);
-        }
-        
-        let pi_estimate = 4.0 * total_inside as f64 / n as f64;
-        if pi_estimate < 1.0 || pi_estimate > 5.0 {
-            println!("警告: GPU计算结果异常 (π ≈ {:.6}), 可能有错误", pi_estimate);
-        }
-        
         drop(data);
         staging_buffer.unmap();
         
-        // 纯GPU计算结果
-        pi_estimate
+        // 返回这个批次的π估计值
+        4.0 * total_inside as f64 / n as f64
     } else {
-        panic!("GPU计算失败");
+        panic!("GPU批次计算失败");
     }
 }
