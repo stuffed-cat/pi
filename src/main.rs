@@ -1,6 +1,9 @@
 use std::io;
 use std::sync::Arc;
 use std::thread;
+use rand::{Rng, SeedableRng};
+use rand::rngs::StdRng;
+use getrandom::getrandom;
 
 use wgpu::util::DeviceExt;
 
@@ -51,9 +54,9 @@ fn main() {
         .read_line(&mut entropy_input)
         .expect("读取熵输入失败");
     
-    // 从用户输入生成熵
-    let user_entropy = generate_entropy_from_input(&entropy_input);
-    println!("已收集到 {} 字节的用户熵", entropy_input.len());
+    // 从用户输入和系统随机源生成高质量熵
+    let user_entropy = generate_crypto_entropy(&entropy_input);
+    println!("已收集到 {} 字节的用户熵，并结合系统密码学随机源", entropy_input.len());
     
     println!("开始计算...");
     let start_time = std::time::Instant::now();
@@ -77,16 +80,23 @@ fn main() {
     println!("计算耗时: {:.2?}", duration);
 }
 
-// 从用户输入生成熵
-fn generate_entropy_from_input(input: &str) -> u64 {
+// 使用密码学级别的随机数生成器生成高质量熵
+fn generate_crypto_entropy(user_input: &str) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     use std::time::{SystemTime, UNIX_EPOCH};
     
+    // 从系统获取密码学安全的随机字节
+    let mut crypto_bytes = [0u8; 32];
+    getrandom(&mut crypto_bytes).expect("获取系统随机数失败");
+    
     let mut hasher = DefaultHasher::new();
     
     // 哈希用户输入
-    input.hash(&mut hasher);
+    user_input.hash(&mut hasher);
+    
+    // 哈希密码学随机字节
+    crypto_bytes.hash(&mut hasher);
     
     // 添加当前时间作为额外熵
     let now = SystemTime::now()
@@ -96,14 +106,19 @@ fn generate_entropy_from_input(input: &str) -> u64 {
     now.hash(&mut hasher);
     
     // 添加输入长度和字符统计
-    input.len().hash(&mut hasher);
+    user_input.len().hash(&mut hasher);
     
     // 对每个字符的位置和值进行哈希
-    for (i, ch) in input.chars().enumerate() {
+    for (i, ch) in user_input.chars().enumerate() {
         (i, ch as u32).hash(&mut hasher);
     }
     
-    hasher.finish()
+    // 额外混合密码学随机数
+    let mut crypto_u64 = [0u8; 8];
+    getrandom(&mut crypto_u64).expect("获取系统随机数失败");
+    let extra_entropy = u64::from_le_bytes(crypto_u64);
+    
+    hasher.finish() ^ extra_entropy
 }
 
 fn calculate_pi_monte_carlo_mt(n: u128, user_entropy: u64) -> f64 {
@@ -138,25 +153,27 @@ fn calculate_pi_monte_carlo_mt(n: u128, user_entropy: u64) -> f64 {
         let handle = thread::spawn(move || {
             use std::time::{SystemTime, UNIX_EPOCH};
             
-            // 每个线程使用不同的随机种子，结合用户熵
-            let base_seed = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos() as u64;
+            // 每个线程使用密码学级别的随机数生成器
+            let mut crypto_seed = [0u8; 32];
+            getrandom(&mut crypto_seed).expect("获取系统随机数失败");
             
-            // 将用户熵与时间和线程ID结合
-            let seed = base_seed 
-                .wrapping_add(user_entropy) 
-                .wrapping_add((i as u64) * 1000000)
-                .wrapping_mul(i as u64 + 1);
+            // 将用户熵混合到种子中
+            let user_entropy_bytes = user_entropy.to_le_bytes();
+            let thread_entropy = (i as u64).to_le_bytes();
             
-            let mut rng = SimpleRng::new(seed);
+            // 混合多种熵源
+            for j in 0..8 {
+                crypto_seed[j] ^= user_entropy_bytes[j % 8];
+                crypto_seed[j + 8] ^= thread_entropy[j % 8];
+            }
+            
+            let mut rng = StdRng::from_seed(crypto_seed);
             let mut local_inside = 0;
             
             for _ in 0..samples {
-                // 生成 [-1, 1] 范围内的随机点
-                let x = rng.next_f64() * 2.0 - 1.0;
-                let y = rng.next_f64() * 2.0 - 1.0;
+                // 使用密码学级别随机数生成 [-1, 1] 范围内的随机点
+                let x: f64 = rng.gen_range(-1.0..1.0);
+                let y: f64 = rng.gen_range(-1.0..1.0);
                 
                 // 检查点是否在单位圆内
                 if x * x + y * y <= 1.0 {
@@ -180,42 +197,6 @@ fn calculate_pi_monte_carlo_mt(n: u128, user_entropy: u64) -> f64 {
     
     // π = 4 * (圆内点数 / 总点数)
     4.0 * total_inside as f64 / n as f64
-}
-
-// 改进的随机数生成器 - 使用PCG算法
-struct SimpleRng {
-    state: u64,
-    inc: u64,
-}
-
-impl SimpleRng {
-    fn new(seed: u64) -> Self {
-        let mut rng = SimpleRng { 
-            state: 0, 
-            inc: (seed << 1) | 1  // 确保inc是奇数
-        };
-        rng.next(); // 预热一次
-        rng.state = rng.state.wrapping_add(seed);
-        rng.next(); // 再预热一次
-        rng
-    }
-    
-    fn next(&mut self) -> u32 {
-        // PCG (Permuted Congruential Generator) 算法
-        let oldstate = self.state;
-        self.state = oldstate.wrapping_mul(6364136223846793005).wrapping_add(self.inc);
-        let xorshifted = (((oldstate >> 18) ^ oldstate) >> 27) as u32;
-        let rot = (oldstate >> 59) as u32;
-        (xorshifted >> rot) | (xorshifted << ((!rot + 1) & 31))
-    }
-    
-    fn next_f64(&mut self) -> f64 {
-        // 使用两次32位随机数生成一个53位精度的f64
-        let a = self.next() as u64;
-        let b = self.next() as u64;
-        let combined = (a << 21) | (b >> 11);
-        (combined as f64) / (1u64 << 53) as f64
-    }
 }
 
 // GPU计算相关结构
