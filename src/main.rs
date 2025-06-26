@@ -27,14 +27,11 @@ fn main() {
         .read_line(&mut input)
         .expect("读取输入失败");
     
-    let n: u64 = match input.trim().parse() {
+    let n: u128 = match input.trim().parse() {
         Ok(num) => {
             if num == 0 {
                 println!("采样点数量必须大于0，使用默认值 1000000");
                 1000000
-            } else if num > 1_000_000_000_000 {
-                println!("采样点数量太大，限制为最大值 1,000,000,000,000");
-                1_000_000_000_000
             } else {
                 num
             }
@@ -61,18 +58,19 @@ fn main() {
     println!("使用 {} 个采样点", n);
     println!("计算得到的π值: {:.20}", pi);
     println!("真实π值:       {:.20}", std::f64::consts::PI);
-    println!("误差:          {:.20}", (pi - std::f64::consts::PI).abs());
-    println!("相对误差:      {:.2e}", (pi - std::f64::consts::PI).abs() / std::f64::consts::PI * 100.0);
+    println!("绝对误差:      {:.20}", (pi - std::f64::consts::PI).abs());
+    let relative_error = (pi - std::f64::consts::PI).abs() / std::f64::consts::PI;
+    println!("相对误差:      {:.6e} ({:.4}%)", relative_error, relative_error * 100.0);
     println!("计算耗时: {:.2?}", duration);
 }
 
-fn calculate_pi_monte_carlo_mt(n: u64) -> f64 {
+fn calculate_pi_monte_carlo_mt(n: u128) -> f64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     
     // 获取系统CPU核心数
     let num_threads = thread::available_parallelism()
         .map(|p| p.get())
-        .unwrap_or(4) as u64;
+        .unwrap_or(4) as u128;
     
     println!("使用 {} 个线程", num_threads);
     
@@ -102,7 +100,7 @@ fn calculate_pi_monte_carlo_mt(n: u64) -> f64 {
             let seed = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
-                .as_nanos() as u64 + i * 1000000;
+                .as_nanos() as u64 + (i as u64) * 1000000;
             
             let mut rng = SimpleRng::new(seed);
             let mut local_inside = 0;
@@ -170,11 +168,11 @@ struct GpuOutput {
     inside_count: u32,
 }
 
-async fn calculate_pi_gpu(n: u64) -> f64 {
+async fn calculate_pi_gpu(n: u128) -> f64 {
     calculate_pi_gpu_impl(n).await
 }
 
-async fn calculate_pi_gpu_impl(n: u64) -> f64 {
+async fn calculate_pi_gpu_impl(n: u128) -> f64 {
     // 初始化GPU设备
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::all(),
@@ -215,7 +213,7 @@ async fn calculate_pi_gpu_impl(n: u64) -> f64 {
     
     // GPU分批处理策略
     let max_samples_per_workgroup = 200000u32; // 每组最多20万样本
-    let max_samples_per_batch = max_compute_workgroups_per_dimension as u64 * max_samples_per_workgroup as u64;
+    let max_samples_per_batch = max_compute_workgroups_per_dimension as u128 * max_samples_per_workgroup as u128;
     
     println!("GPU单批次最大处理能力: {} 个采样点", max_samples_per_batch);
     
@@ -225,11 +223,11 @@ async fn calculate_pi_gpu_impl(n: u64) -> f64 {
         calculate_pi_gpu_batch(&device, &queue, n, max_compute_workgroups_per_dimension).await
     } else {
         // 多批次处理
-        let num_batches = ((n as f64) / (max_samples_per_batch as f64)).ceil() as u64;
+        let num_batches = ((n as f64) / (max_samples_per_batch as f64)).ceil() as u128;
         println!("数据量过大，将分 {} 个批次进行GPU处理", num_batches);
         
-        let mut total_inside = 0u64;
-        let mut processed_samples = 0u64;
+        let mut total_inside = 0u128;
+        let mut processed_samples = 0u128;
         
         for batch in 0..num_batches {
             let batch_start = batch * max_samples_per_batch;
@@ -239,7 +237,7 @@ async fn calculate_pi_gpu_impl(n: u64) -> f64 {
             println!("处理批次 {}/{}: {} 个采样点", batch + 1, num_batches, batch_size);
             
             let batch_pi = calculate_pi_gpu_batch(&device, &queue, batch_size, max_compute_workgroups_per_dimension).await;
-            let batch_inside = (batch_pi * batch_size as f64 / 4.0) as u64;
+            let batch_inside = (batch_pi * batch_size as f64 / 4.0) as u128;
             
             total_inside += batch_inside;
             processed_samples += batch_size;
@@ -254,7 +252,7 @@ async fn calculate_pi_gpu_impl(n: u64) -> f64 {
     }
 }
 
-async fn calculate_pi_gpu_batch(device: &wgpu::Device, queue: &wgpu::Queue, n: u64, max_workgroups: u32) -> f64 {
+async fn calculate_pi_gpu_batch(device: &wgpu::Device, queue: &wgpu::Queue, n: u128, max_workgroups: u32) -> f64 {
     let max_samples_per_workgroup = 200000u32;
     
     // 计算这个批次的工作组配置
@@ -264,8 +262,8 @@ async fn calculate_pi_gpu_batch(device: &wgpu::Device, queue: &wgpu::Queue, n: u
     );
     
     let actual_workgroups = if ideal_workgroups == 0 { 1 } else { ideal_workgroups };
-    let samples_per_workgroup = (n / actual_workgroups as u64) as u32;
-    let extra_samples = (n % actual_workgroups as u64) as u32;
+    let samples_per_workgroup = (n / actual_workgroups as u128) as u32;
+    let extra_samples = (n % actual_workgroups as u128) as u32;
     
     // 创建计算着色器
     let compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
