@@ -159,8 +159,8 @@ impl SimpleRng {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct GpuInput {
-    total_samples: u32,
-    seed: u32,
+    samples_per_workgroup: u32,
+    extra_samples: u32,
 }
 
 #[repr(C)]
@@ -170,19 +170,6 @@ struct GpuOutput {
 }
 
 async fn calculate_pi_gpu(n: u64) -> f64 {
-    // 对于超大数据集，增加GPU处理能力，限制提高到1万亿
-    if n > 1_000_000_000_000 {  // 1万亿
-        println!("数据量过大，GPU计算限制为1万亿个采样点，超出部分使用CPU计算");
-        let gpu_samples = 1_000_000_000_000u64;
-        let cpu_samples = n - gpu_samples;
-        
-        let gpu_pi = Box::pin(calculate_pi_gpu_impl(gpu_samples)).await;
-        let cpu_pi = calculate_pi_monte_carlo_mt(cpu_samples);
-        
-        // 加权平均
-        return (gpu_pi * gpu_samples as f64 + cpu_pi * cpu_samples as f64) / n as f64;
-    }
-    
     calculate_pi_gpu_impl(n).await
 }
 
@@ -225,41 +212,43 @@ async fn calculate_pi_gpu_impl(n: u64) -> f64 {
              max_compute_workgroups_per_dimension, 
              max_buffer_size / 1024 / 1024);
     
-    // 智能计算工作组数量 - 基于GPU实际限制
+    // 智能计算工作组数量 - 进一步降低每组样本数
+    let max_samples_per_workgroup = 50000u32; // 每组最多5万样本，确保GPU稳定性
+    
+    // 计算最优工作组配置
     let ideal_workgroups = std::cmp::min(
-        max_compute_workgroups_per_dimension, 
-        (n / 10000).max(1) as u32  // 每个工作组至少处理10000个样本
+        max_compute_workgroups_per_dimension,
+        ((n as f64) / (max_samples_per_workgroup as f64)).ceil() as u32
     );
     
-    // 确保单个工作组的样本数不超过u32最大值
-    let samples_per_workgroup = std::cmp::min(
-        u32::MAX as u64, 
-        (n / ideal_workgroups as u64).max(1)
-    ) as u32;
+    // 如果需要的工作组数超过GPU限制，调整每组样本数
+    let actual_workgroups = if ideal_workgroups > max_compute_workgroups_per_dimension {
+        max_compute_workgroups_per_dimension
+    } else {
+        ideal_workgroups
+    };
     
-    let actual_workgroups = std::cmp::min(
-        ideal_workgroups,
-        ((n as f64) / (samples_per_workgroup as f64)).ceil() as u32
-    );
+    // 平均分配样本到工作组
+    let samples_per_workgroup = (n / actual_workgroups as u64) as u32;
+    let extra_samples = (n % actual_workgroups as u64) as u32;
     
-    let remaining_samples = (n % (actual_workgroups as u64 * samples_per_workgroup as u64)) as u32;
-    
-    // 如果单个工作组需要处理的样本数为0，说明数据分配有问题
-    if samples_per_workgroup == 0 || actual_workgroups == 0 {
-        println!("数据量太大，GPU无法处理，回退到CPU计算");
-        return calculate_pi_monte_carlo_mt(n);
+    // 检查每组样本数是否仍然过多
+    if samples_per_workgroup > 1000000 {
+        println!("警告: 每个工作组仍需处理 {} 个样本，可能导致GPU超时", samples_per_workgroup);
+        println!("建议减少采样点数量或使用CPU计算");
     }
     
-    println!("工作组数量: {}, 每组处理样本数: {}, 剩余样本: {}", 
-             actual_workgroups, samples_per_workgroup, remaining_samples);
+    println!("GPU配置: 工作组数 = {}, 每组基础样本数 = {}, 额外样本 = {}", 
+             actual_workgroups, samples_per_workgroup, extra_samples);
+    println!("GPU将处理全部 {} 个采样点", n);
     
-    // 创建计算着色器 - 使用内联字符串而不是文件
+    // 创建计算着色器 - 修复随机数生成和样本数分配问题
     let compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("Monte Carlo Pi Compute Shader"),
         source: wgpu::ShaderSource::Wgsl(r#"
 struct Input {
-    total_samples: u32,
-    seed: u32,
+    samples_per_workgroup: u32,
+    extra_samples: u32,
 }
 
 struct Output {
@@ -272,32 +261,56 @@ var<uniform> input: Input;
 @group(0) @binding(1)
 var<storage, read_write> output: array<Output>;
 
-fn random(state: ptr<function, u32>) -> f32 {
-    *state = (*state * 1103515245u + 12345u);
-    return f32(*state) / 4294967296.0;
+// 改进的随机数生成器 - 使用xorshift32算法
+fn xorshift32(state: ptr<function, u32>) -> u32 {
+    var x = *state;
+    x = x ^ (x << 13u);
+    x = x ^ (x >> 17u);
+    x = x ^ (x << 5u);
+    *state = x;
+    return x;
+}
+
+fn random_f32(state: ptr<function, u32>) -> f32 {
+    return f32(xorshift32(state)) / 4294967296.0;
 }
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let index = global_id.x;
-    if (index >= arrayLength(&output)) {
+    let workgroup_id = global_id.x;
+    if (workgroup_id >= arrayLength(&output)) {
         return;
     }
     
-    // 确保每个线程有不同的随机种子
-    var rng_state = input.seed + index * 2654435761u;
+    // 确保每个工作组有不同的随机种子
+    var rng_state = 12345u + workgroup_id * 1013904223u + 1u;
+    if (rng_state == 0u) {
+        rng_state = 1u;
+    }
+    
     var inside_count = 0u;
     
-    for (var i = 0u; i < input.total_samples; i++) {
-        let x = random(&rng_state) * 2.0 - 1.0;
-        let y = random(&rng_state) * 2.0 - 1.0;
+    // 基础样本数
+    var samples_to_process = input.samples_per_workgroup;
+    
+    // 前extra_samples个工作组需要处理额外的一个样本
+    if (workgroup_id < input.extra_samples) {
+        samples_to_process = samples_to_process + 1u;
+    }
+    
+    // 处理分配给这个工作组的所有样本
+    for (var i = 0u; i < samples_to_process; i++) {
+        let x = random_f32(&rng_state) * 2.0 - 1.0;
+        let y = random_f32(&rng_state) * 2.0 - 1.0;
         
-        if (x * x + y * y <= 1.0) {
+        let distance_squared = x * x + y * y;
+        if (distance_squared <= 1.0) {
             inside_count = inside_count + 1u;
         }
     }
     
-    output[index].inside_count = inside_count;
+    // 将结果写入输出缓冲区
+    output[workgroup_id].inside_count = inside_count;
 }
         "#.into()),
     });
@@ -306,11 +319,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let input_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("Input Buffer"),
         contents: bytemuck::cast_slice(&[GpuInput {
-            total_samples: samples_per_workgroup,
-            seed: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as u32,
+            samples_per_workgroup: samples_per_workgroup,
+            extra_samples: extra_samples,
         }]),
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
@@ -417,51 +427,30 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let result: &[GpuOutput] = bytemuck::cast_slice(&data);
         
         let total_inside: u64 = result.iter().map(|r| r.inside_count as u64).sum();
-        let processed_samples = actual_workgroups as u64 * samples_per_workgroup as u64;
         
-        println!("GPU计算完成: 圆内点数 = {}, 处理样本数 = {}", total_inside, processed_samples);
+        println!("GPU计算完成: 圆内点数 = {}, 总样本数 = {} (100%GPU处理)", total_inside, n);
+        
+        // 检查结果是否合理
+        if total_inside == 0 && n > 0 {
+            println!("错误: GPU计算返回0个圆内点数，可能是计算错误");
+            println!("前几个工作组的结果: {:?}", &result[..std::cmp::min(5, result.len())]);
+            println!("回退到CPU计算");
+            drop(data);
+            staging_buffer.unmap();
+            return calculate_pi_monte_carlo_mt(n);
+        }
+        
+        let pi_estimate = 4.0 * total_inside as f64 / n as f64;
+        if pi_estimate < 1.0 || pi_estimate > 5.0 {
+            println!("警告: GPU计算结果异常 (π ≈ {:.6}), 可能有错误", pi_estimate);
+        }
         
         drop(data);
         staging_buffer.unmap();
         
-        // 处理剩余样本（如果有的话）
-        let gpu_pi = 4.0 * total_inside as f64 / processed_samples as f64;
-        
-        if remaining_samples > 0 {
-            // 简单起见，剩余样本用CPU处理
-            let cpu_inside = calculate_pi_monte_carlo_simple(remaining_samples as u64);
-            let cpu_pi = 4.0 * cpu_inside / remaining_samples as f64;
-            
-            // 加权平均
-            (gpu_pi * processed_samples as f64 + cpu_pi * remaining_samples as f64) / n as f64
-        } else {
-            gpu_pi
-        }
+        // 纯GPU计算结果
+        pi_estimate
     } else {
         panic!("GPU计算失败");
     }
-}
-
-// 简单的CPU计算函数，用于处理剩余样本
-fn calculate_pi_monte_carlo_simple(n: u64) -> f64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64;
-    
-    let mut rng = SimpleRng::new(seed);
-    let mut inside_circle = 0;
-    
-    for _ in 0..n {
-        let x = rng.next_f64() * 2.0 - 1.0;
-        let y = rng.next_f64() * 2.0 - 1.0;
-        
-        if x * x + y * y <= 1.0 {
-            inside_circle += 1;
-        }
-    }
-    
-    inside_circle as f64
 }
