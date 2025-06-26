@@ -2,8 +2,24 @@ use std::io;
 use std::sync::Arc;
 use std::thread;
 
+use wgpu::util::DeviceExt;
+
 fn main() {
     println!("蒙特卡洛方法计算π");
+    println!("请选择计算方式:");
+    println!("1. CPU多线程计算");
+    println!("2. GPU计算");
+    
+    let mut choice = String::new();
+    io::stdin()
+        .read_line(&mut choice)
+        .expect("读取选择失败");
+    
+    let use_gpu = match choice.trim() {
+        "2" => true,
+        _ => false,
+    };
+    
     println!("请输入采样点数量：");
     
     let mut input = String::new();
@@ -29,9 +45,17 @@ fn main() {
         }
     };
     
-    println!("开始计算，使用多线程...");
+    println!("开始计算...");
     let start_time = std::time::Instant::now();
-    let pi = calculate_pi_monte_carlo_mt(n);
+    
+    let pi = if use_gpu {
+        println!("使用GPU计算");
+        pollster::block_on(calculate_pi_gpu(n))
+    } else {
+        println!("使用CPU多线程计算");
+        calculate_pi_monte_carlo_mt(n)
+    };
+    
     let duration = start_time.elapsed();
     
     println!("使用 {} 个采样点", n);
@@ -129,4 +153,265 @@ impl SimpleRng {
     fn next_f64(&mut self) -> f64 {
         (self.next() as f64) / (u64::MAX as f64)
     }
+}
+
+// GPU计算相关结构
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuInput {
+    total_samples: u32,
+    seed: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuOutput {
+    inside_count: u32,
+}
+
+async fn calculate_pi_gpu(n: u64) -> f64 {
+    // 初始化GPU设备
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::all(),
+        ..Default::default()
+    });
+    
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        })
+        .await
+        .unwrap();
+
+    let (device, queue) = adapter
+        .request_device(
+            &wgpu::DeviceDescriptor {
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+                label: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    println!("GPU设备: {}", adapter.get_info().name);
+    
+    // 简化工作组计算 - 限制为最多10000个工作组
+    let max_workgroups = std::cmp::min(10000, n / 1000).max(1) as u32;
+    let samples_per_workgroup = (n / max_workgroups as u64) as u32;
+    let remaining_samples = (n % max_workgroups as u64) as u32;
+    
+    println!("工作组数量: {}, 每组处理样本数: {}, 剩余样本: {}", 
+             max_workgroups, samples_per_workgroup, remaining_samples);
+    
+    // 创建计算着色器 - 使用内联字符串而不是文件
+    let compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("Monte Carlo Pi Compute Shader"),
+        source: wgpu::ShaderSource::Wgsl(r#"
+struct Input {
+    total_samples: u32,
+    seed: u32,
+}
+
+struct Output {
+    inside_count: u32,
+}
+
+@group(0) @binding(0)
+var<uniform> input: Input;
+
+@group(0) @binding(1)
+var<storage, read_write> output: array<Output>;
+
+fn random(state: ptr<function, u32>) -> f32 {
+    *state = (*state * 1103515245u + 12345u);
+    return f32(*state) / 4294967295.0;
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let index = global_id.x;
+    if (index >= arrayLength(&output)) {
+        return;
+    }
+    
+    var rng_state = input.seed + index * 1000u;
+    var inside_count = 0u;
+    
+    for (var i = 0u; i < input.total_samples; i++) {
+        let x = random(&rng_state) * 2.0 - 1.0;
+        let y = random(&rng_state) * 2.0 - 1.0;
+        
+        if (x * x + y * y <= 1.0) {
+            inside_count++;
+        }
+    }
+    
+    output[index].inside_count = inside_count;
+}
+        "#.into()),
+    });
+
+    // 创建输入缓冲区
+    let input_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("Input Buffer"),
+        contents: bytemuck::cast_slice(&[GpuInput {
+            total_samples: samples_per_workgroup,
+            seed: 12345,
+        }]),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    });
+
+    // 创建输出缓冲区
+    let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Output Buffer"),
+        size: (max_workgroups * std::mem::size_of::<GpuOutput>() as u32) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+
+    // 创建读取缓冲区
+    let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Staging Buffer"),
+        size: output_buffer.size(),
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    // 创建绑定组布局
+    let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: None,
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+
+    // 创建绑定组
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: input_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: output_buffer.as_entire_binding(),
+            },
+        ],
+    });
+
+    // 创建计算管线
+    let compute_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("Compute Pipeline Layout"),
+        bind_group_layouts: &[&bind_group_layout],
+        push_constant_ranges: &[],
+    });
+
+    let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("Compute Pipeline"),
+        layout: Some(&compute_pipeline_layout),
+        module: &compute_shader,
+        entry_point: "main",
+    });
+
+    // 执行计算
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("Compute Encoder"),
+    });
+
+    {
+        let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("Compute Pass"),
+            timestamp_writes: None,
+        });
+        compute_pass.set_pipeline(&compute_pipeline);
+        compute_pass.set_bind_group(0, &bind_group, &[]);
+        compute_pass.dispatch_workgroups(max_workgroups, 1, 1);
+    }
+
+    encoder.copy_buffer_to_buffer(&output_buffer, 0, &staging_buffer, 0, output_buffer.size());
+    queue.submit(std::iter::once(encoder.finish()));
+
+    // 读取结果
+    let buffer_slice = staging_buffer.slice(..);
+    let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
+    buffer_slice.map_async(wgpu::MapMode::Read, move |v| sender.send(v).unwrap());
+    device.poll(wgpu::Maintain::Wait);
+
+    if let Some(Ok(())) = receiver.receive().await {
+        let data = buffer_slice.get_mapped_range();
+        let result: &[GpuOutput] = bytemuck::cast_slice(&data);
+        
+        let total_inside: u64 = result.iter().map(|r| r.inside_count as u64).sum();
+        let processed_samples = max_workgroups as u64 * samples_per_workgroup as u64;
+        
+        println!("GPU计算完成: 圆内点数 = {}, 处理样本数 = {}", total_inside, processed_samples);
+        
+        drop(data);
+        staging_buffer.unmap();
+        
+        // 处理剩余样本（如果有的话）
+        let gpu_pi = 4.0 * total_inside as f64 / processed_samples as f64;
+        
+        if remaining_samples > 0 {
+            // 简单起见，剩余样本用CPU处理
+            let cpu_inside = calculate_pi_monte_carlo_simple(remaining_samples as u64);
+            let cpu_pi = 4.0 * cpu_inside / remaining_samples as f64;
+            
+            // 加权平均
+            (gpu_pi * processed_samples as f64 + cpu_pi * remaining_samples as f64) / n as f64
+        } else {
+            gpu_pi
+        }
+    } else {
+        panic!("GPU计算失败");
+    }
+}
+
+// 简单的CPU计算函数，用于处理剩余样本
+fn calculate_pi_monte_carlo_simple(n: u64) -> f64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    
+    let mut rng = SimpleRng::new(seed);
+    let mut inside_circle = 0;
+    
+    for _ in 0..n {
+        let x = rng.next_f64() * 2.0 - 1.0;
+        let y = rng.next_f64() * 2.0 - 1.0;
+        
+        if x * x + y * y <= 1.0 {
+            inside_circle += 1;
+        }
+    }
+    
+    inside_circle as f64
 }
