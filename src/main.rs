@@ -134,23 +134,39 @@ fn calculate_pi_monte_carlo_mt(n: u128) -> f64 {
     4.0 * total_inside as f64 / n as f64
 }
 
-// 简单的线性同余生成器
+// 改进的随机数生成器 - 使用PCG算法
 struct SimpleRng {
     state: u64,
+    inc: u64,
 }
 
 impl SimpleRng {
     fn new(seed: u64) -> Self {
-        SimpleRng { state: seed }
+        let mut rng = SimpleRng { 
+            state: 0, 
+            inc: (seed << 1) | 1  // 确保inc是奇数
+        };
+        rng.next(); // 预热一次
+        rng.state = rng.state.wrapping_add(seed);
+        rng.next(); // 再预热一次
+        rng
     }
     
-    fn next(&mut self) -> u64 {
-        self.state = self.state.wrapping_mul(1103515245).wrapping_add(12345);
-        self.state
+    fn next(&mut self) -> u32 {
+        // PCG (Permuted Congruential Generator) 算法
+        let oldstate = self.state;
+        self.state = oldstate.wrapping_mul(6364136223846793005).wrapping_add(self.inc);
+        let xorshifted = (((oldstate >> 18) ^ oldstate) >> 27) as u32;
+        let rot = (oldstate >> 59) as u32;
+        (xorshifted >> rot) | (xorshifted << ((!rot + 1) & 31))
     }
     
     fn next_f64(&mut self) -> f64 {
-        (self.next() as f64) / (u64::MAX as f64)
+        // 使用两次32位随机数生成一个53位精度的f64
+        let a = self.next() as u64;
+        let b = self.next() as u64;
+        let combined = (a << 21) | (b >> 11);
+        (combined as f64) / (1u64 << 53) as f64
     }
 }
 
@@ -284,7 +300,17 @@ var<uniform> input: Input;
 @group(0) @binding(1)
 var<storage, read_write> output: array<Output>;
 
-// 改进的随机数生成器 - 使用xorshift32算法
+// 改进的随机数生成器 - 使用多种算法混合获得更好的随机性
+fn wang_hash(seed: u32) -> u32 {
+    var s = seed;
+    s = (s ^ 61u) ^ (s >> 16u);
+    s = s * 9u;
+    s = s ^ (s >> 4u);
+    s = s * 0x27d4eb2du;
+    s = s ^ (s >> 15u);
+    return s;
+}
+
 fn xorshift32(state: ptr<function, u32>) -> u32 {
     var x = *state;
     x = x ^ (x << 13u);
@@ -294,8 +320,26 @@ fn xorshift32(state: ptr<function, u32>) -> u32 {
     return x;
 }
 
-fn random_f32(state: ptr<function, u32>) -> f32 {
-    return f32(xorshift32(state)) / 4294967296.0;
+fn pcg_hash(input: u32) -> u32 {
+    var state = input * 747796405u + 2891336453u;
+    var word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+fn better_random(state: ptr<function, u32>, seed_offset: u32) -> u32 {
+    // 结合多种随机数算法以获得更好的随机性
+    var xor_result = xorshift32(state);
+    var wang_result = wang_hash(*state + seed_offset);
+    var pcg_result = pcg_hash(xor_result ^ wang_result);
+    
+    // 更新状态
+    *state = xor_result ^ pcg_result;
+    
+    return pcg_result;
+}
+
+fn random_f32(state: ptr<function, u32>, seed_offset: u32) -> f32 {
+    return f32(better_random(state, seed_offset)) / 4294967296.0;
 }
 
 @compute @workgroup_size(256)
@@ -305,8 +349,12 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         return;
     }
     
-    // 确保每个工作组有不同的随机种子
-    var rng_state = 12345u + workgroup_id * 1013904223u + 1u;
+    // 使用更复杂的种子生成策略，包含时间相关的变化
+    var base_seed = 12345u + workgroup_id * 1013904223u;
+    var time_seed = workgroup_id * 982451653u + 1234567u;
+    var rng_state = wang_hash(base_seed) ^ pcg_hash(time_seed);
+    
+    // 确保种子不为0
     if (rng_state == 0u) {
         rng_state = 1u;
     }
@@ -323,8 +371,10 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     
     // 处理分配给这个工作组的所有样本
     for (var i = 0u; i < samples_to_process; i++) {
-        let x = random_f32(&rng_state) * 2.0 - 1.0;
-        let y = random_f32(&rng_state) * 2.0 - 1.0;
+        // 为每个样本使用不同的种子偏移
+        let seed_offset = i * 2654435761u + workgroup_id;
+        let x = random_f32(&rng_state, seed_offset) * 2.0 - 1.0;
+        let y = random_f32(&rng_state, seed_offset + 1u) * 2.0 - 1.0;
         
         let distance_squared = x * x + y * y;
         if (distance_squared <= 1.0) {
